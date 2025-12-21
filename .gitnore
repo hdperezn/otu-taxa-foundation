@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+wandb/
+runs/
+checkpoints/
+data/
+artifacts/
+*.pt
+*.pth
+*.npy
+*.npz
