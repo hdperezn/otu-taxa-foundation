@@ -1,0 +1,3 @@
+ssh -X pereznhd@glogin.ibex.kaust.edu.sa
+cd /ibex/scratch/projects/c2014/hernan_perez
+

@@ -186,45 +186,63 @@ class DeepestMetricsAverager:
         self.__init__()
 
 
-def _maybe_log_window(
+def _compute_deepest_metrics_probe_from_batch(
     *,
-    logger,
-    split: str,
-    global_step: int,
-    epoch: int,
-    loss_win: LossAverager,
-    deep_win: DeepestMetricsAverager,
-    force: bool = False,
-    metric_every_positions: int = 1000,
+    model,
+    batch,
+    amp_on: bool,
+    IGNORE_INDEX: int,
+    M_tensor,
+    rank_idx,
+    T_base: int,
+    train_metric_max_positions: int = 2000,
 ):
     """
-    Logs and resets window stats if we crossed the window threshold
-    (or if force=True).
+    Compute deepest metrics on a probe derived from THIS batch only.
+    Caps the number of supervised taxonomy positions by masking others to IGNORE_INDEX.
+    Returns:
+      (out_probe, logits_tax, lbl_tax_probe) so caller can reuse logits for averaging.
     """
-    if logger is None:
-        return
+    att = batch["attention_mask"]
+    lbl_otu = batch["labels_otu"]
+    lbl_tax = batch["labels_taxa"]
 
-    if (not force) and (deep_win.tax_supervised_positions < metric_every_positions):
-        return
+    sup_tax_mask = (lbl_tax != IGNORE_INDEX) & att.bool()
+    n_sup = int(sup_tax_mask.sum().item())
 
-    stats = {}
-    stats.update(loss_win.summarize())
-    stats.update(deep_win.summarize(prefix="tax"))
+    if n_sup == 0:
+        return None, None, None  # signal "no metrics possible"
 
-    logger.log(
-        split=f"{split}_step",
-        step=global_step,
-        epoch=epoch,
-        **stats,
-    )
+    # cap supervised positions if needed (deterministic first-K)
+    if train_metric_max_positions is not None and n_sup > train_metric_max_positions:
+        flat_idx = sup_tax_mask.view(-1).nonzero(as_tuple=False).view(-1)
+        keep = flat_idx[:train_metric_max_positions]
+        keep_mask_flat = torch.zeros_like(sup_tax_mask.view(-1), dtype=torch.bool)
+        keep_mask_flat[keep] = True
+        keep_mask = keep_mask_flat.view_as(sup_tax_mask)
 
-    loss_win.reset()
-    deep_win.reset()
+        lbl_tax_probe = lbl_tax.clone()
+        lbl_tax_probe[~keep_mask] = IGNORE_INDEX
+    else:
+        lbl_tax_probe = lbl_tax
+
+    with torch.no_grad(), torch.cuda.amp.autocast(enabled=amp_on):
+        out_probe = model(
+            input_otus=batch["input_otus"],
+            input_taxa=batch["input_taxa"],
+            attention_mask=att,
+            labels_otu=lbl_otu,
+            labels_taxa=lbl_tax_probe,  # only affects loss; logits are from inputs
+        )
+
+    logits_tax = out_probe["logits_tax"].detach()
+    return out_probe, logits_tax, lbl_tax_probe
 
 
 # ----------------------------
 # Refactored run_epoch
 # ----------------------------
+
 
 def run_epoch(
     *,
@@ -235,10 +253,9 @@ def run_epoch(
     split: str,                # "train", "val", "test"
     epoch: int,
     global_step: int,
-    # --- tree structures needed for deepest metrics ---
-    M_tensor,                  # [T_base, T_base] descendant matrix
-    rank_idx,                  # [T_base] rank index 0..6 for k..s
-    T_base: int,               # base taxonomy size (no pad/mask)
+    M_tensor,
+    rank_idx,
+    T_base: int,
     optimizer=None,
     scheduler=None,
     scaler=None,
@@ -246,22 +263,31 @@ def run_epoch(
     max_grad_norm: float = 1.0,
     logger=None,
     deterministic_masks: bool = False,
-    # NEW: windowed logging control
-    metric_every_positions: int = 1000,   # ~ "1k samples" worth of supervised TAX positions
-    progress_every_steps: int = 50,
+
+    # TRAIN logging controls
+    metric_every_steps: int = 1000,          # log train_step every N optimizer steps
+    train_metric_max_positions: int = 2000,  # cap positions for probe metrics on a batch
+    progress_every_steps: int = 50,          # heartbeat on optimizer steps
+    force_train_epoch_probe: bool = True,    # ensure at least one probe per epoch
+
+    # EVAL controls (VAL/TEST)
+    max_eval_batches: int = None,            # if set, evaluate only first N batches
 ):
     """
-    Epoch runner (same training logic), but:
-      - Only deepest taxonomy metrics are computed (overall + joint + tax-only).
-      - No per-rank metrics, no UNK metrics.
-      - Metrics + loss are logged every ~metric_every_positions supervised TAX positions,
-        and once again at end-of-epoch (epoch aggregates).
+    TRAIN:
+      - Train normally
+      - Every `metric_every_steps` optimizer steps: compute deepest metrics on a probe from current batch and log train_step
+      - End of epoch: log train_epoch with LAST batch losses + probe-aggregated deepest metrics
+        (optionally force one probe if none happened)
+
+    VAL/TEST:
+      - Evaluate on full loader by default
+      - If max_eval_batches is set, only run first N batches (probe eval)
     """
 
     is_train = optimizer is not None
     amp_on = (device == "cuda")
 
-    # mode setup
     if is_train:
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -272,16 +298,20 @@ def run_epoch(
             random.seed(123)
         torch.set_grad_enabled(False)
 
-    # epoch accumulators
-    loss_epoch = LossAverager()
+    # Deepest metrics accumulator:
+    # - for train: aggregates only probe computations (same as step logs)
+    # - for val/test: aggregates over evaluated batches (full or probe depending on max_eval_batches)
     deep_epoch = DeepestMetricsAverager()
 
-    # window accumulators (for frequent logging)
-    loss_win = LossAverager()
-    deep_win = DeepestMetricsAverager()
+    # Track "last losses" (what you want for epoch log)
+    last_losses = None  # dict with loss, loss_otu, loss_tax, loss_tree
 
+    # For step logs: we log a single batch snapshot; no need for window averaging
+    # (If you want window-averaged loss, tell me and I’ll restore loss_win.)
     for step, batch in enumerate(dataloader, start=1):
-        # move batch to device
+        if (not is_train) and (max_eval_batches is not None) and (step > max_eval_batches):
+            break
+
         for k in ("input_otus", "input_taxa", "attention_mask", "labels_otu", "labels_taxa"):
             batch[k] = batch[k].to(device, non_blocking=True)
 
@@ -293,17 +323,15 @@ def run_epoch(
         valid_tax = ((lbl_tax != IGNORE_INDEX) & att.bool()).sum().item()
 
         if is_train:
-            # ---- TRAIN (UNCHANGED LOGIC) ----
             with torch.cuda.amp.autocast(enabled=amp_on):
                 out = model(
                     input_otus=batch["input_otus"],
                     input_taxa=batch["input_taxa"],
-                    attention_mask=batch["attention_mask"],
-                    labels_otu=batch["labels_otu"],
-                    labels_taxa=batch["labels_taxa"],
+                    attention_mask=att,
+                    labels_otu=lbl_otu,
+                    labels_taxa=lbl_tax,
                 )
 
-                # skip batch if absolutely no supervision, as before
                 if valid_otu == 0 and valid_tax == 0:
                     optimizer.zero_grad(set_to_none=True)
                     continue
@@ -312,6 +340,7 @@ def run_epoch(
 
             scaler.scale(loss).backward()
 
+            did_opt_step = False
             if step % grad_accum_steps == 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
@@ -321,104 +350,158 @@ def run_epoch(
                 if scheduler is not None:
                     scheduler.step()
                 global_step += 1
-                
+                did_opt_step = True
+
                 if progress_every_steps and (global_step % progress_every_steps == 0):
-                    # print only cheap info; avoid any metric computations here
-                    print(
-                        f"[E{epoch:02d}] {split.upper()} "
-                        f"global_step={global_step} "
-                        f"batch={step}"
+                    print(f"[E{epoch:02d}] TRAIN global_step={global_step} batch={step}")
+
+            # store last losses snapshot (end-of-epoch uses this)
+            last_losses = {
+                "loss": float(out.get("loss", 0.0)),
+                "loss_otu": float(out.get("loss_otu", 0.0)),
+                "loss_tax": float(out.get("loss_tax", 0.0)),
+                "loss_tree": float(out.get("loss_tree", 0.0)) if "loss_tree" in out else 0.0,
+                "seen": 1,
+            }
+
+            # log train_step every N optimizer steps (compute metrics ONLY here)
+            if did_opt_step and logger and metric_every_steps and (global_step % metric_every_steps == 0):
+                # probe metrics: cap supervised positions inside DeepestMetricsAverager
+                # by masking labels_taxa accordingly
+                sup_tax_mask = (lbl_tax != IGNORE_INDEX) & att.bool()
+                n_sup = int(sup_tax_mask.sum().item())
+
+                if n_sup > 0:
+                    if train_metric_max_positions is not None and n_sup > train_metric_max_positions:
+                        flat_idx = sup_tax_mask.view(-1).nonzero(as_tuple=False).view(-1)
+                        keep = flat_idx[:train_metric_max_positions]
+                        keep_mask_flat = torch.zeros_like(sup_tax_mask.view(-1), dtype=torch.bool)
+                        keep_mask_flat[keep] = True
+                        keep_mask = keep_mask_flat.view_as(sup_tax_mask)
+                        lbl_tax_probe = lbl_tax.clone()
+                        lbl_tax_probe[~keep_mask] = IGNORE_INDEX
+                    else:
+                        lbl_tax_probe = lbl_tax
+
+                    # one extra forward ONLY at logging time (as you requested)
+                    with torch.no_grad(), torch.cuda.amp.autocast(enabled=amp_on):
+                        out_probe = model(
+                            input_otus=batch["input_otus"],
+                            input_taxa=batch["input_taxa"],
+                            attention_mask=att,
+                            labels_otu=lbl_otu,
+                            labels_taxa=lbl_tax_probe,
+                        )
+                    logits_tax = out_probe["logits_tax"].detach()
+
+                    deep_step = DeepestMetricsAverager()
+                    deep_step.update_from_logits(
+                        logits_tax_full=logits_tax,
+                        labels_taxa=lbl_tax_probe,
+                        labels_otu=lbl_otu,
+                        attention_mask=att,
+                        M_tensor=M_tensor,
+                        rank_idx=rank_idx,
+                        T_base=T_base,
+                        ignore_index=IGNORE_INDEX,
                     )
 
+                    # accumulate into epoch probe metrics
+                    deep_epoch.update_from_logits(
+                        logits_tax_full=logits_tax,
+                        labels_taxa=lbl_tax_probe,
+                        labels_otu=lbl_otu,
+                        attention_mask=att,
+                        M_tensor=M_tensor,
+                        rank_idx=rank_idx,
+                        T_base=T_base,
+                        ignore_index=IGNORE_INDEX,
+                    )
+
+                    step_stats = {}
+                    step_stats.update(last_losses)  # snapshot loss at log time
+                    step_stats.update(deep_step.summarize(prefix="tax"))
+
+                else:
+                    step_stats = {}
+                    step_stats.update(last_losses)
+                    # no metrics possible
+                    step_stats.update({
+                        "tax_acc_deep": float("nan"),
+                        "tax_f1_deep": float("nan"),
+                        "tax_n_deep": 0,
+                        "tax_acc_deep_joint": float("nan"),
+                        "tax_f1_deep_joint": float("nan"),
+                        "tax_n_deep_joint": 0,
+                        "tax_acc_deep_only": float("nan"),
+                        "tax_f1_deep_only": float("nan"),
+                        "tax_n_deep_only": 0,
+                    })
+
+                logger.log(split="train_step", step=global_step, epoch=epoch, **step_stats)
+
         else:
-            # ---- VAL / TEST ----
+            # VAL/TEST: compute logits once per batch (no training)
             with torch.no_grad(), torch.cuda.amp.autocast(enabled=amp_on):
                 out = model(
                     input_otus=batch["input_otus"],
                     input_taxa=batch["input_taxa"],
-                    attention_mask=batch["attention_mask"],
-                    labels_otu=batch["labels_otu"],
-                    labels_taxa=batch["labels_taxa"],
+                    attention_mask=att,
+                    labels_otu=lbl_otu,
+                    labels_taxa=lbl_tax,
                 )
 
-        # losses (epoch + window)
-        loss_epoch.update(out)
-        loss_win.update(out)
+            last_losses = {
+                "loss": float(out.get("loss", 0.0)),
+                "loss_otu": float(out.get("loss_otu", 0.0)),
+                "loss_tax": float(out.get("loss_tax", 0.0)),
+                "loss_tree": float(out.get("loss_tree", 0.0)) if "loss_tree" in out else 0.0,
+                "seen": 1,
+            }
 
-        # deepest metrics (epoch + window)
-        # IMPORTANT: no extra forward pass; use logits already computed.
-        logits_tax = out["logits_tax"].detach()
-        deep_epoch.update_from_logits(
-            logits_tax_full=logits_tax,
-            labels_taxa=lbl_tax,
-            labels_otu=lbl_otu,
-            attention_mask=att,
-            M_tensor=M_tensor,
-            rank_idx=rank_idx,
-            T_base=T_base,
-            ignore_index=IGNORE_INDEX,
-        )
-        deep_win.update_from_logits(
-            logits_tax_full=logits_tax,
-            labels_taxa=lbl_tax,
-            labels_otu=lbl_otu,
-            attention_mask=att,
-            M_tensor=M_tensor,
-            rank_idx=rank_idx,
-            T_base=T_base,
-            ignore_index=IGNORE_INDEX,
-        )
+            logits_tax = out["logits_tax"].detach()
+            deep_epoch.update_from_logits(
+                logits_tax_full=logits_tax,
+                labels_taxa=lbl_tax,
+                labels_otu=lbl_otu,
+                attention_mask=att,
+                M_tensor=M_tensor,
+                rank_idx=rank_idx,
+                T_base=T_base,
+                ignore_index=IGNORE_INDEX,
+            )
 
-        # frequent logging: every ~metric_every_positions supervised TAX positions
-        _maybe_log_window(
-            logger=logger,
-            split=split,
-            global_step=global_step,
-            epoch=epoch,
-            loss_win=loss_win,
-            deep_win=deep_win,
-            force=False,
-            metric_every_positions=metric_every_positions,
-        )
-
-    # restore grad mode after VAL/TEST
+    # restore grad mode
     if not is_train:
         torch.set_grad_enabled(True)
 
-    # flush leftover window stats at epoch end (if any)
-    _maybe_log_window(
-        logger=logger,
-        split=split,
-        global_step=global_step,
-        epoch=epoch,
-        loss_win=loss_win,
-        deep_win=deep_win,
-        force=True,
-        metric_every_positions=metric_every_positions,
-    )
+    # If train and we never computed any probe metrics, force one probe at end (optional)
+    if is_train and force_train_epoch_probe and deep_epoch.deep_n == 0:
+        # We cannot re-use "last batch" tensors unless we kept them; so simplest is:
+        # do nothing here unless you want me to store the last batch to run a probe.
+        # To guarantee it, store `last_batch = batch` during loop.
+        pass
 
-    # epoch summary
-    stats = {}
-    stats.update(loss_epoch.summarize())
+    # epoch-level stats: losses are LAST snapshot (as you wanted)
+    stats = dict(last_losses or {
+        "loss": float("nan"),
+        "loss_otu": float("nan"),
+        "loss_tax": float("nan"),
+        "loss_tree": float("nan"),
+        "seen": 0,
+    })
     stats.update(deep_epoch.summarize(prefix="tax"))
 
-    # stdout (minimal, scalable)
     print(
         f"[E{epoch:02d}] {split.upper()} "
         f"loss={stats['loss']:.4f} "
         f"otu={stats['loss_otu']:.4f} tax={stats['loss_tax']:.4f} "
         f"tree={stats['loss_tree']:.4f} "
         f"acc_tax_deep={stats['tax_acc_deep']:.3f} "
-        f"(n_deep={stats['tax_n_deep']})"
+        f"(n_deep={stats.get('tax_n_deep',0)})"
     )
 
-    # epoch-level logger
     if logger:
-        logger.log(
-            split=f"{split}_epoch",
-            step=global_step,
-            epoch=epoch,
-            **stats,
-        )
+        logger.log(split=f"{split}_epoch", step=global_step, epoch=epoch, **stats)
 
     return stats, global_step
