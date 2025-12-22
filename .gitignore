@@ -1,13 +1,16 @@
-__pycache__/
-*.pyc
-.ipynb_checkpoints/
-.venv/
-wandb/
-runs/
+# Training runs / experiment outputs
+runs*/
+runs/**
 checkpoints/
-data/
-artifacts/
+metrics.jsonl
+*.jsonl
+
+# WandB
+wandb/
+
+# Torch / numpy artifacts
 *.pt
 *.pth
+*.ckpt
 *.npy
 *.npz
