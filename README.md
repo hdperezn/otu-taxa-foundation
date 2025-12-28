@@ -31,3 +31,12 @@ repository.
 This repository contains the code needed to reproduce their construction and to
 load them during model training. 
 
+---
+
+## Model overview
+
+![OTU–Taxa foundation model architecture](figures/foundation_OTU_and_TAXA-Model_scheme.jpg)
+
+**Figure 1.** Overview of the OTU–Taxa foundation model. The model jointly encodes
+OTU abundance information and hierarchical taxonomy tokens using a shared
+Transformer backbone, enabling taxonomy-aware pretraining and downstream tasks.
