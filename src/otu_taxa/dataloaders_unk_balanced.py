@@ -514,3 +514,65 @@ def make_tax_only_mask_collator(dataset, affected_ids, *, T_base: int, max_len=N
         }
 
     return collate
+
+# # ---------- taxonomy collator: mask TAX only at affected OTU positions ----------
+# def make_tax_only_mask_collator(dataset, affected_ids, *, T_base: int, max_len=None):
+#     """
+#     dataset.O is fine.
+#     dataset.T is T_real (not used for PAD/MASK anymore).
+#     T_base is the UNK-extended taxonomy size (real + 7 UNKs), no specials.
+#     """
+#     O = dataset.O
+#     pad_otu_id, mask_otu_id = O, O + 1
+
+#     pad_tax_id, mask_tax_id = T_base, T_base + 1  # IMPORTANT (matches model)
+
+#     affected_ids = set(map(int, affected_ids))
+
+#     def collate(batch):
+#         lengths = [len(b["otus"]) for b in batch]
+#         L = max_len if max_len is not None else max(lengths)
+#         B = len(batch)
+
+#         input_otus = torch.full((B, L), pad_otu_id, dtype=torch.long)
+#         input_taxa = torch.full((B, L), pad_tax_id, dtype=torch.long)
+#         attention_mask = torch.zeros((B, L), dtype=torch.bool)
+
+#         masked_positions = []
+#         sample_ids = []
+#         true_taxa = []
+
+#         for i, rec in enumerate(batch):
+#             otus = torch.tensor(rec["otus"], dtype=torch.long)
+#             taxa = torch.tensor(rec["taxa"], dtype=torch.long)
+
+#             L_i = min(L, len(otus))
+#             input_otus[i, :L_i] = otus[:L_i]
+#             input_taxa[i, :L_i] = taxa[:L_i]
+#             attention_mask[i, :L_i] = True
+
+#             # affected OTU positions
+#             aff_mask = torch.tensor(
+#                 [int(int(x) in affected_ids) for x in otus[:L_i]],
+#                 dtype=torch.bool
+#             )
+
+#             # MASK taxonomy at affected positions
+#             input_taxa[i, :L_i][aff_mask] = mask_tax_id
+
+#             pos_idx = torch.nonzero(aff_mask, as_tuple=False).view(-1).tolist()
+#             masked_positions.append(pos_idx)
+
+#             sample_ids.append(rec["sample_id"])
+#             true_taxa.append(rec["taxa"])  # keep original behavior (list/seq)
+
+#         return {
+#             "input_otus": input_otus,
+#             "input_taxa": input_taxa,
+#             "attention_mask": attention_mask,
+#             "masked_positions": masked_positions,
+#             "sample_ids": sample_ids,
+#             "true_taxa": true_taxa,
+#         }
+
+#     return collate
