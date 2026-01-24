@@ -49,10 +49,7 @@ This repository is organized to reflect the full lifecycle of the OTU–Taxa
 foundation model, from data preprocessing and pretraining to evaluation and
 analysis. The main components are:
 
-### `configs/`
-Configuration files for experiments and model variants.  
-These files define model hyperparameters, training settings, and dataset
-references, enabling reproducible runs across different experimental setups.
+
 
 ### `figures/`
 Static figures used in the paper and documentation, including model diagrams,
@@ -84,10 +81,6 @@ This directory is organized into thematic subfolders:
 These notebooks are primarily exploratory and are intended to document the
 analysis performed for the paper.
 
-### `scripts/`
-Standalone scripts for running training, evaluation, or preprocessing steps
-from the command line. These scripts provide a lightweight alternative to
-notebooks for batch execution and cluster-based runs.
 
 ### `src/`
 Core Python source code for the project. This directory contains the
@@ -102,8 +95,7 @@ scripts.
 
 ### `runs_microbeatlas/`
 Logs and outputs from pretraining runs on the full Microbe Atlas dataset.
-This typically includes checkpoints, training curves, and evaluation summaries.
-These files are not tracked by Git due to their size.
+This includes checkpoints, run configs, training metrics, and evaluation summaries.
 
 ### `runs_microbeatlas_genus_corruption/`
 Outputs from experiments using corrupted taxonomy references, where a subset
@@ -112,11 +104,6 @@ of species-level annotations is removed during training.
 ### `runs_microbeatlas_k_shot/`
 Outputs from K-shot adaptation experiments, including zero-shot and few-shot
 taxonomy prediction results for held-out OTUs.
-
-### `tests/`
-Unit and integration tests for selected components of the codebase. These
-tests are intended to validate core functionality (e.g., losses, decoding
-logic) as the code evolves.
 
 ---
 
