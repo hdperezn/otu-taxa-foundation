@@ -89,7 +89,7 @@ class MaskingConfig:
     max_len: Optional[int] = None
 
     # NEW: choose one balancing strategy per batch
-    balance_mode: str = "random"          # {"none", "otu", "family", "random"}
+    balance_mode: str = "random"          # {"none", "otu", "random"}
     balance_family_prob: float = 0.50   # only used if balance_mode="random"
 
 def make_collator_balanced(dataset, cfg, tax2fam: Optional[List[int]] = None):

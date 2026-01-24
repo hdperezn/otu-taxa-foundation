@@ -286,7 +286,7 @@ def run_epoch(
     """
 
     is_train = optimizer is not None
-    amp_on = (device == "cuda")
+    amp_on = torch.cuda.is_available() and str(device).startswith("cuda")
 
     if is_train:
         model.train()
